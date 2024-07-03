@@ -1,65 +1,86 @@
 import unittest
 import torch
-from torch import nn
-import numpy as np
+from torch.utils.data import DataLoader
+from torchvision import transforms
 from main import *
 
 
-class TestDeformableCapsuleNet(unittest.TestCase):
+# Dummy data and model for testing
+class DummyDataset(torch.utils.data.Dataset):
+    def __init__(self, num_samples=100):
+        self.num_samples = num_samples
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((128, 128), antialias=True),
+                # transforms.ToTensor(),
+            ]
+        )
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        image = torch.rand(3, 128, 128)
+        target = [{"category_id": 1, "bbox": [10, 10, 50, 50]}]
+        if self.transform:
+            image = self.transform(image)
+        return image, target
+
+
+class TestDeformCapsNet(unittest.TestCase):
+
     def setUp(self):
-        self.num_classes = 80
-        self.image_size = (3, 128, 128)
-        self.model = DeformableCapsuleNet(
-            num_classes=self.num_classes, image_size=self.image_size
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = DeformCapsNet(num_classes=80, image_size=[3, 128, 128]).to(
+            self.device
         )
-        self.model.cuda()
-        self.capsule_loss = CapsuleLoss()
-        self.batch_size = 4
-
-    def test_model_architecture(self):
-        # Check if the model's architecture is correct
-        self.assertIsInstance(self.model.conv1, nn.Conv2d)
-        self.assertIsInstance(self.model.primary_capsules, DeformableCapsuleLayer)
-        self.assertIsInstance(
-            self.model.object_instantiation_capsules, DeformableCapsuleLayer
-        )
-        self.assertIsInstance(
-            self.model.class_presence_capsules, DeformableCapsuleLayer
-        )
-        self.assertIsInstance(self.model.se_routing, SE_Routing)
-        self.assertEqual(
-            self.model.class_presence_capsules.num_capsules, self.num_classes
-        )
-        self.assertEqual(
-            self.model.class_presence_capsules.out_channels, self.num_classes
+        self.loss_fn = CapsuleLoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters())
+        self.dataset = DummyDataset()
+        self.dataloader = DataLoader(
+            self.dataset, batch_size=2, shuffle=True, collate_fn=collate_fn
         )
 
-    def test_forward_pass(self):
-        # Test the forward pass of the model
-        input_tensor = torch.randn(self.batch_size, *self.image_size).cuda()
-        classes, reconstructions = self.model(input_tensor)
+    def test_model_forward(self):
+        data_iter = iter(self.dataloader)
+        images, targets = next(data_iter)
+        images = images.to(self.device)
+        output = self.model(images)
+        self.assertIsInstance(output, torch.Tensor)
+        self.assertEqual(output.size(0), images.size(0))
 
-        self.assertEqual(classes.size(0), self.batch_size)
-        self.assertEqual(classes.size(1), self.num_classes)
-        self.assertEqual(reconstructions.size(0), self.batch_size)
-        self.assertEqual(
-            reconstructions.size(1), np.prod(self.image_size)
-        )  # Flattened reconstruction size
+    def test_capsule_loss(self):
+        data_iter = iter(self.dataloader)
+        images, targets = next(data_iter)
+        images = images.to(self.device)
+        output, bboxes, reconstructions = self.model(images)
+        loss = self.loss_fn(images, targets, output, bboxes, reconstructions)
+        self.assertIsInstance(loss, torch.Tensor)
 
-    def test_loss_computation(self):
-        # Test the loss computation
-        input_tensor = torch.randn(self.batch_size, *self.image_size).cuda()
-        labels = (
-            torch.eye(self.num_classes)
-            .index_select(
-                dim=0, index=torch.randint(0, self.num_classes, (self.batch_size,))
-            )
-            .cuda()
-        )
-        classes, reconstructions = self.model(input_tensor, labels)
-
-        loss = self.capsule_loss(input_tensor, labels, classes, reconstructions)
+    def test_train_step(self):
+        data_iter = iter(self.dataloader)
+        images, targets = next(data_iter)
+        images = images.to(self.device)
+        self.optimizer.zero_grad()
+        output, bboxes, reconstructions = self.model(images)
+        loss = self.loss_fn(images, targets, output, bboxes, reconstructions)
+        loss.backward()
+        self.optimizer.step()
         self.assertIsInstance(loss.item(), float)
+
+    def test_collate_fn(self):
+        data_iter = iter(self.dataloader)
+        images, targets = next(data_iter)
+        self.assertIsInstance(images, torch.Tensor)
+        self.assertIsInstance(targets, tuple)
+        self.assertEqual(len(images), 2)
+
+    def test_data_pipeline(self):
+        for images, targets in self.dataloader:
+            self.assertIsInstance(images, torch.Tensor)
+            self.assertIsInstance(targets, tuple)
+            self.assertEqual(images.size(0), 2)
+            break
 
 
 if __name__ == "__main__":

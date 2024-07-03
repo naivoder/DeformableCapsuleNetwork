@@ -1,186 +1,165 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from torch.autograd import Variable
-import warnings
+import torchvision.datasets.utils as utils
+from torchvision.datasets import CocoDetection
+from torch.utils.data import DataLoader
+from torchvision import transforms
+import os
 
-warnings.simplefilter("ignore")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class DeformableCapsuleLayer(nn.Module):
+def squash(tensor, dim=-1):
+    norm = torch.norm(tensor, p=2, dim=dim, keepdim=True)
+    scale = (norm**2) / (1 + norm**2)
+    return scale * tensor / norm
+
+
+class DeformConvCapsLayer(nn.Module):
     def __init__(
         self,
-        num_capsules,
-        num_route_nodes,
         in_channels,
         out_channels,
-        kernel_size=5,
+        kernel_size,
+        num_capsule,
+        num_atoms,
         stride=1,
-        num_iterations=3,
+        padding=0,
+        routings=3,
     ):
-        super(DeformableCapsuleLayer, self).__init__()
-        self.num_route_nodes = num_route_nodes
-        self.num_iterations = num_iterations
-        self.num_capsules = num_capsules
+        super(DeformConvCapsLayer, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.num_capsule = num_capsule
+        self.num_atoms = num_atoms
+        self.stride = stride
+        self.padding = padding
+        self.routings = routings
 
-        if num_route_nodes != -1:
-            self.route_weights = nn.Parameter(
-                torch.randn(num_capsules, num_route_nodes, in_channels, out_channels)
-            )
-            self.spatial_offsets = nn.Parameter(
-                torch.randn(num_capsules, kernel_size, kernel_size, in_channels)
-            )
-        else:
-            self.capsules = nn.ModuleList(
-                [
-                    nn.Conv2d(
-                        in_channels,
-                        out_channels,
-                        kernel_size=kernel_size,
-                        stride=stride,
-                        padding=0,
-                    )
-                    for _ in range(num_capsules)
-                ]
-            )
-
-    def squash(self, tensor, dim=-1):
-        squared_norm = (tensor**2).sum(dim=dim, keepdim=True)
-        scale = squared_norm / (1 + squared_norm)
-        return scale * tensor / torch.sqrt(squared_norm)
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels * num_capsule * num_atoms,
+            kernel_size,
+            stride,
+            padding,
+        )
+        self.offsets = nn.Conv2d(
+            in_channels, 2 * kernel_size * kernel_size, kernel_size, stride, padding
+        )
+        self.biases = nn.Parameter(torch.zeros(1, out_channels, num_capsule, num_atoms))
 
     def forward(self, x):
-        if self.num_route_nodes != -1:
-            priors = x[None, :, :, None, :] @ self.route_weights[:, None, :, :, :]
-            priors = priors + self.spatial_offsets[:, None, :, :, None]
-            logits = Variable(torch.zeros(*priors.size())).cuda()
-            for i in range(self.num_iterations):
-                probs = F.softmax(logits, dim=2)
-                outputs = self.squash((probs * priors).sum(dim=2, keepdim=True))
-                if i != self.num_iterations - 1:
-                    delta_logits = (priors * outputs).sum(dim=-1, keepdim=True)
-                    logits = logits + delta_logits
-        else:
-            outputs = [capsule(x).view(x.size(0), -1, 1) for capsule in self.capsules]
-            outputs = torch.cat(outputs, dim=-1)
-            outputs = self.squash(outputs)
+        batch_size = x.size(0)
+        offsets = self.offsets(x)
+        offsets = offsets.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 2)
+        x = self.conv(x)
+        votes = x.view(
+            batch_size, self.out_channels, self.num_capsule, self.num_atoms, -1
+        )
+        votes = votes.permute(0, 1, 4, 2, 3).contiguous()
 
-        return outputs
+        logits = torch.zeros(*votes.size()).to(x.device)
+        for i in range(self.routings):
+            route = F.softmax(logits, dim=3)
+            preactivate = torch.sum(route * votes, dim=2) + self.biases
+            activation = squash(preactivate)
+            act_replicated = activation.unsqueeze(2).expand_as(votes)
+            logits += torch.sum(votes * act_replicated, dim=-1, keepdim=True)
+        return activation
 
 
-class SE_Routing(nn.Module):
-    def __init__(self, in_capsules, out_capsules, num_iterations=3, reduction_ratio=16):
-        super(SE_Routing, self).__init__()
-        self.num_iterations = num_iterations
+class SplitCaps(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        num_classes,
+        num_capsule,
+        num_atoms,
+        kernel_size,
+        stride=1,
+        padding=0,
+        routings=3,
+    ):
+        super(SplitCaps, self).__init__()
+        self.num_classes = num_classes
+        self.num_capsule = num_capsule
+        self.num_atoms = num_atoms
+
+        self.instantiation_caps = DeformConvCapsLayer(
+            in_channels,
+            num_capsule,
+            kernel_size,
+            num_capsule,
+            num_atoms,
+            stride,
+            padding,
+            routings,
+        )
+        self.class_presence_caps = DeformConvCapsLayer(
+            in_channels,
+            num_classes,
+            kernel_size,
+            num_capsule,
+            num_atoms,
+            stride,
+            padding,
+            routings,
+        )
+
+    def forward(self, x):
+        instantiation = self.instantiation_caps(x)
+        class_presence = self.class_presence_caps(x)
+        return instantiation, class_presence
+
+
+class SERouting(nn.Module):
+    def __init__(self, reduction_ratio=4):
+        super(SERouting, self).__init__()
         self.reduction_ratio = reduction_ratio
 
-        # Squeeze-and-Excitation layers for dynamic routing
-        self.fc1 = nn.Linear(in_capsules, in_capsules // reduction_ratio)
-        self.fc2 = nn.Linear(in_capsules // reduction_ratio, out_capsules)
-        self.sigmoid = nn.Sigmoid()
+    def forward(self, instantiation, class_presence):
+        batch_size, num_capsule, _, num_atoms = instantiation.size()
+        combined = torch.cat([instantiation, class_presence], dim=-1)
+        excitation = F.relu(
+            nn.Linear(num_atoms * 2, num_atoms // self.reduction_ratio)(combined)
+        )
+        excitation = torch.sigmoid(
+            nn.Linear(num_atoms // self.reduction_ratio, num_atoms * 2)(excitation)
+        )
+        routed_caps = excitation * combined
+        return routed_caps
+
+
+class DeformCapsNet(nn.Module):
+    def __init__(self, num_classes, image_size):
+        super(DeformCapsNet, self).__init__()
+        in_channels = image_size[0]
+        self.backbone = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.split_caps = SplitCaps(
+            128,
+            num_classes,
+            num_capsule=8,
+            num_atoms=16,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            routings=3,
+        )
+        self.se_routing = SERouting()
 
     def forward(self, x):
-        batch_size, num_capsules, _ = x.size()
-        x_mean = x.mean(dim=1, keepdim=True)
-        x_reduced = F.relu(self.fc1(x_mean))
-        routing_weights = self.sigmoid(self.fc2(x_reduced))
-        routing_weights = routing_weights.view(batch_size, num_capsules, -1)
-        return routing_weights
-
-
-class DeformableCapsuleNet(nn.Module):
-    def __init__(self, num_classes=80, image_size=(3, 128, 128)):
-        super(DeformableCapsuleNet, self).__init__()
-        self.num_classes = num_classes
-        self.num_channels = image_size[0]  # RGB or grayscale
-
-        self.conv1 = nn.Conv2d(
-            in_channels=self.num_channels, out_channels=256, kernel_size=9, stride=1
-        )
-        self.primary_capsules = DeformableCapsuleLayer(
-            num_capsules=8,
-            num_route_nodes=-1,
-            in_channels=256,
-            out_channels=32,
-            kernel_size=9,
-            stride=2,
-        )
-        self.object_instantiation_capsules = DeformableCapsuleLayer(
-            num_capsules=num_classes,
-            num_route_nodes=2048,
-            in_channels=8,
-            out_channels=64,  # Increased dimensions to accommodate class-specific variations
-            kernel_size=5,
-        )
-        self.class_presence_capsules = DeformableCapsuleLayer(
-            num_capsules=num_classes,
-            num_route_nodes=2048,
-            in_channels=8,
-            out_channels=num_classes,  # Number of classes for class presence
-            kernel_size=5,
-        )
-        self.bbox_capsules = DeformableCapsuleLayer(
-            num_capsules=num_classes,
-            num_route_nodes=2048,
-            in_channels=8,
-            out_channels=4,  # Bounding box coordinates (x, y, w, h)
-            kernel_size=5,
-        )
-        self.se_routing = SE_Routing(in_capsules=64, out_capsules=num_classes)
-
-        flattened_input_size = 64 * num_classes
-        flattened_output_size = np.prod(image_size)
-
-        self.decoder = nn.Sequential(
-            nn.Linear(flattened_input_size, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, flattened_output_size),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x, y=None):
-        x = F.relu(self.conv1(x), inplace=True)
-        x = self.primary_capsules(x)
-
-        # Object instantiation capsules
-        obj_inst_capsules = (
-            self.object_instantiation_capsules(x).squeeze().transpose(0, 1)
-        )
-
-        # Class presence capsules
-        class_pres_capsules = self.class_presence_capsules(x).squeeze().transpose(0, 1)
-
-        # Bounding box capsules
-        bbox_capsules = self.bbox_capsules(x).squeeze().transpose(0, 1)
-
-        # SE-Routing for dynamic weight assignment
-        routing_weights = self.se_routing(obj_inst_capsules)
-        obj_inst_capsules = obj_inst_capsules * routing_weights
-
-        classes = (class_pres_capsules**2).sum(dim=-1) ** 0.5
-        classes = F.softmax(classes, dim=-1)
-
-        if y is None:
-            _, max_length_indices = classes.max(dim=1)
-            y = (
-                Variable(torch.eye(self.num_classes))
-                .to(DEVICE)
-                .index_select(dim=0, index=max_length_indices.data)
-            )
-
-        reconstructions = self.decoder(
-            (obj_inst_capsules * y[:, :, None]).view(x.size(0), -1)
-        )
-        reconstructions = reconstructions.view(
-            -1, self.num_channels, self.image_size[0], self.image_size[1]
-        )
-
-        return classes, bbox_capsules, reconstructions
+        features = self.backbone(x)
+        instantiation, class_presence = self.split_caps(features)
+        routed_caps = self.se_routing(instantiation, class_presence)
+        return routed_caps
 
 
 class CapsuleLoss(nn.Module):
@@ -190,7 +169,6 @@ class CapsuleLoss(nn.Module):
         self.bbox_loss = nn.SmoothL1Loss(reduction="sum")
 
     def forward(self, images, targets, classes, bboxes, reconstructions):
-        # Extract labels and bounding boxes from targets
         labels = torch.zeros(classes.size()).to(DEVICE)
         target_bboxes = torch.zeros(bboxes.size()).to(DEVICE)
         for i, target in enumerate(targets):
@@ -206,7 +184,6 @@ class CapsuleLoss(nn.Module):
         margin_loss = labels * left + 0.5 * (1.0 - labels) * right
         margin_loss = margin_loss.sum()
 
-        assert torch.numel(images) == torch.numel(reconstructions)
         images = images.view(reconstructions.size()[0], -1)
         reconstruction_loss = self.reconstruction_loss(reconstructions, images)
 
@@ -257,44 +234,25 @@ def evaluate(model, test_loader, capsule_loss):
     )
 
 
-def collate_fn(batch):
-    images, targets = zip(*batch)
-    images = torch.stack([img for img in images], dim=0)
-    return images, targets
-
-
 if __name__ == "__main__":
-    import torchvision.datasets.utils as utils
-    from torchvision.datasets import CocoDetection
-    from torch.utils.data import DataLoader
-    from torchvision import transforms
-    import os
-
     data_dir = "./data"
     os.makedirs(data_dir, exist_ok=True)
 
-    train_zip = os.path.join(data_dir, "train2017.zip")
-    val_zip = os.path.join(data_dir, "val2017.zip")
-    ann_zip = os.path.join(data_dir, "annotations_trainval2017.zip")
-    train_dir = os.path.join(data_dir, "train2017")
-    val_dir = os.path.join(data_dir, "val2017")
-    ann_dir = os.path.join(data_dir, "annotations")
-
-    if not os.path.exists(train_dir):
+    if not os.path.exists(os.path.join(data_dir, "train2017")):
         utils.download_and_extract_archive(
             url="http://images.cocodataset.org/zips/train2017.zip",
             download_root=data_dir,
             extract_root=data_dir,
         )
 
-    if not os.path.exists(val_dir):
+    if not os.path.exists(os.path.join(data_dir, "val2017")):
         utils.download_and_extract_archive(
             url="http://images.cocodataset.org/zips/val2017.zip",
             download_root=data_dir,
             extract_root=data_dir,
         )
 
-    if not os.path.exists(ann_dir):
+    if not os.path.exists(os.path.join(data_dir, "annotations")):
         utils.download_and_extract_archive(
             url="http://images.cocodataset.org/annotations/annotations_trainval2017.zip",
             download_root=data_dir,
@@ -333,7 +291,7 @@ if __name__ == "__main__":
     img_size = list(sample_img.shape)
     print("\nImage Size:", img_size)
 
-    model = DeformableCapsuleNet(num_classes=80, image_size=img_size)
+    model = DeformCapsNet(num_classes=80, image_size=img_size)
     model.to(DEVICE)
 
     optimizer = torch.optim.Adam(model.parameters())
