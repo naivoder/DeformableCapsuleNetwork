@@ -148,7 +148,9 @@ class DeformableCapsuleNet(nn.Module):
         x = self.primary_capsules(x)
 
         # Object instantiation capsules
-        obj_inst_capsules = self.object_inst_capsules(x).squeeze().transpose(0, 1)
+        obj_inst_capsules = (
+            self.object_instantiation_capsules(x).squeeze().transpose(0, 1)
+        )
 
         # Class presence capsules
         class_pres_capsules = self.class_presence_capsules(x).squeeze().transpose(0, 1)
@@ -167,7 +169,7 @@ class DeformableCapsuleNet(nn.Module):
             _, max_length_indices = classes.max(dim=1)
             y = (
                 Variable(torch.eye(self.num_classes))
-                .cuda()
+                .to(DEVICE)
                 .index_select(dim=0, index=max_length_indices.data)
             )
 
@@ -189,12 +191,14 @@ class CapsuleLoss(nn.Module):
 
     def forward(self, images, targets, classes, bboxes, reconstructions):
         # Extract labels and bounding boxes from targets
-        labels = torch.zeros(classes.size()).cuda()
-        target_bboxes = torch.zeros(bboxes.size()).cuda()
+        labels = torch.zeros(classes.size()).to(DEVICE)
+        target_bboxes = torch.zeros(bboxes.size()).to(DEVICE)
         for i, target in enumerate(targets):
             for obj in target:
                 labels[i, obj["category_id"]] = 1
-                target_bboxes[i, obj["category_id"]] = torch.tensor(obj["bbox"]).cuda()
+                target_bboxes[i, obj["category_id"]] = torch.tensor(obj["bbox"]).to(
+                    DEVICE
+                )
 
         left = F.relu(0.9 - classes, inplace=True) ** 2
         right = F.relu(classes - 0.1, inplace=True) ** 2
