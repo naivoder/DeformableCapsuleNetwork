@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Data
+/data/
+
+# PyTorch
+*.pt
+*.pth
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# System files
+.DS_Store
+.env
