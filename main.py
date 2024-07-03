@@ -17,8 +17,8 @@ class DeformableCapsuleLayer(nn.Module):
         num_route_nodes,
         in_channels,
         out_channels,
-        kernel_size=None,
-        stride=None,
+        kernel_size=5,
+        stride=1,
         num_iterations=3,
     ):
         super(DeformableCapsuleLayer, self).__init__()
@@ -122,6 +122,13 @@ class DeformableCapsuleNet(nn.Module):
             out_channels=num_classes,  # Number of classes for class presence
             kernel_size=5,
         )
+        self.bbox_capsules = DeformableCapsuleLayer(
+            num_capsules=num_classes,
+            num_route_nodes=2048,
+            in_channels=8,
+            out_channels=4,  # Bounding box coordinates (x, y, w, h)
+            kernel_size=5,
+        )
         self.se_routing = SE_Routing(in_capsules=64, out_capsules=num_classes)
 
         flattened_input_size = 64 * num_classes
@@ -146,6 +153,9 @@ class DeformableCapsuleNet(nn.Module):
         # Class presence capsules
         class_pres_capsules = self.class_presence_capsules(x).squeeze().transpose(0, 1)
 
+        # Bounding box capsules
+        bbox_capsules = self.bbox_capsules(x).squeeze().transpose(0, 1)
+
         # SE-Routing for dynamic weight assignment
         routing_weights = self.se_routing(obj_inst_capsules)
         obj_inst_capsules = obj_inst_capsules * routing_weights
@@ -168,15 +178,24 @@ class DeformableCapsuleNet(nn.Module):
             -1, self.num_channels, self.image_size[0], self.image_size[1]
         )
 
-        return classes, reconstructions
+        return classes, bbox_capsules, reconstructions
 
 
 class CapsuleLoss(nn.Module):
     def __init__(self):
         super(CapsuleLoss, self).__init__()
-        self.reconstruction_loss = nn.MSELoss(size_average=False)
+        self.reconstruction_loss = nn.MSELoss(reduction="sum")
+        self.bbox_loss = nn.SmoothL1Loss(reduction="sum")
 
-    def forward(self, images, labels, classes, reconstructions):
+    def forward(self, images, targets, classes, bboxes, reconstructions):
+        # Extract labels and bounding boxes from targets
+        labels = torch.zeros(classes.size()).cuda()
+        target_bboxes = torch.zeros(bboxes.size()).cuda()
+        for i, target in enumerate(targets):
+            for obj in target:
+                labels[i, obj["category_id"]] = 1
+                target_bboxes[i, obj["category_id"]] = torch.tensor(obj["bbox"]).cuda()
+
         left = F.relu(0.9 - classes, inplace=True) ** 2
         right = F.relu(classes - 0.1, inplace=True) ** 2
 
@@ -187,17 +206,25 @@ class CapsuleLoss(nn.Module):
         images = images.view(reconstructions.size()[0], -1)
         reconstruction_loss = self.reconstruction_loss(reconstructions, images)
 
-        return (margin_loss + 0.0005 * reconstruction_loss) / images.size(0)
+        bbox_loss = self.bbox_loss(bboxes, target_bboxes)
+
+        return (margin_loss + 0.0005 * reconstruction_loss + bbox_loss) / images.size(0)
+
+
+def collate_fn(batch):
+    images, targets = zip(*batch)
+    images = torch.stack([img for img in images], dim=0)
+    return images, targets
 
 
 def train(model, train_loader, optimizer, capsule_loss, num_epochs):
     model.train()
     for epoch in range(num_epochs):
-        for batch_id, (data, target) in enumerate(train_loader):
-            data, target = data.to(DEVICE), target.to(DEVICE)
+        for batch_id, (data, targets) in enumerate(train_loader):
+            data = data.to(DEVICE)
             optimizer.zero_grad()
-            output, reconstructions = model(data, target)
-            loss = capsule_loss(data, target, output, reconstructions)
+            output, bboxes, reconstructions = model(data)
+            loss = capsule_loss(data, targets, output, bboxes, reconstructions)
             loss.backward()
             optimizer.step()
             if batch_id % 100 == 0:
@@ -211,12 +238,14 @@ def evaluate(model, test_loader, capsule_loss):
     test_loss = 0
     correct = 0
     with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(DEVICE), target.to(DEVICE)
-            output, reconstructions = model(data)
-            test_loss += capsule_loss(data, target, output, reconstructions).item()
+        for data, targets in test_loader:
+            data = data.to(DEVICE)
+            output, bboxes, reconstructions = model(data)
+            test_loss += capsule_loss(
+                data, targets, output, bboxes, reconstructions
+            ).item()
             pred = output.max(1, keepdim=True)[1]
-            correct += pred.eq(target.view_as(pred)).sum().item()
+            correct += pred.eq(targets.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
     print(
